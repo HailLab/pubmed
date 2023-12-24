@@ -1,9 +1,11 @@
 import requests
-from bs4 import BeautifulSoup
-from ftplib import FTP
+import time
 import os
-import tarfile
 import csv
+from pdfminer.high_level import extract_text
+import pdfplumber
+import fitz
+
 
 from openai import OpenAI
 
@@ -11,21 +13,54 @@ client = OpenAI() #api_key=OPENAI_API_KEY)
 
 def main():
     pmid_to_path = {}
-    get_pmid_to_paths("oa_file_list.csv", pmid_to_path)
+    #get_pmid_to_paths("oa_file_list.csv", pmid_to_path)
     #get_pmid_to_paths("oa_non_comm_use_pdf.csv", pmid_to_path)
     print("map done")
 
-    f = open("pmids.txt")
-    pmids = f.readlines()
-    f.close()
+    directory_path = 'data/'
+    process_pdfs_in_directory(directory_path)
 
-    for line in pmids:
-        pmid = line.strip() 
-        if pmid in pmid_to_path:
-            print("-- Got", pmid)
-            process_pmid(pmid, pmid_to_path[pmid])
-        else:
-            print("No match for", pmid)
+def process_pdfs_in_directory(directory):
+    i = 0
+    f = open('output.txt', 'w')
+
+    for filename in os.listdir(directory):
+        if filename.endswith('.pdf'):
+            pmid = filename.split('.')[0]
+            print(i, filename, pmid)
+            pdf_path = os.path.join(directory, filename)
+            #text = extract_text(pdf_path)
+            text = get_text(pdf_path)
+            result = process(pmid, text)
+            f.write(result + '\n')
+            f.flush()
+
+        i += 1
+
+def get_text(pdf_path):
+    text = ''
+    with fitz.open(pdf_path) as doc:
+        for page in doc:
+            # Extract text in dict format
+            blocks = page.get_text("dict")["blocks"]
+            for block in blocks:
+                if 'lines' in block:  # Ensure it's a text block
+                    for line in block["lines"]:
+                        for span in line["spans"]:
+                            text += span["text"] + ' '
+                    text += '\n'
+    return text
+
+
+def get_text2(pdf_path):
+    with pdfplumber.open(pdf_path) as pdf:
+        text = ''
+        for page in pdf.pages:
+            # Extract text from the page while maintaining the layout
+            page_text = page.extract_text()
+            if page_text:
+                text += page_text + '\n'
+    return text
 
 def get_pmid_to_paths(file_name, pmid_to_path):
     print(f"getting paths for {file_name}")
@@ -50,62 +85,15 @@ def get_pmid_to_paths(file_name, pmid_to_path):
 
             pmid_to_path[pmid] = path
      
-def download_file(ftp_server, ftp_path, local_path):
-    with FTP(ftp_server) as ftp:
-        ftp.login()
-        with open('data/' + local_path, 'wb') as file:
-            ftp.retrbinary('RETR ' + ftp_path, file.write)
-        
-        if '.pdf' in local_path:
-            pass
-        else:
-            with tarfile.open('data/' + local_path, 'r:gz') as tar:
-                extract_to = 'data/'
-                tar.extractall(path=extract_to)
-
-def process_pmid(pmid, path_to_file):
-    ftp_base_url = 'ftp.ncbi.nlm.nih.gov'
-    fpt_pre_path = 'pub/pmc/'
-    ftp_file_path = fpt_pre_path + path_to_file
-    if '.pdf' in os.path.basename(path_to_file):
-        write_path = pmid + '.pdf'
-    else:
-        write_path = pmid + '.tar.gz'
-
-    download_file(ftp_base_url, ftp_file_path, write_path)
-
-def process_url(pmid):
-    url = f'https://pubmed.ncbi.nlm.nih.gov/{pmid}/'
-    print(url)
-
-    # Send a GET request to the URL
-    response = requests.get(url)
-
-    # Parse the HTML content
-    soup = BeautifulSoup(response.content, 'html.parser')
-
-    # Find the URL within the specified class
-    try:
-        pmc_link = soup.find('a', class_='link-item pmc')['href']
-        print(f'Extracted URL: {pmc_link}')
-
-        pmc_response = requests.get(pmc_link)
-        soup = BeautifulSoup(pmc_response.content, 'html.parser')
-        text = soup.get_text(separator='\n')
-        print(text)
-        #print(response.content)
-        result = open_ai_request(str(text)[:16000])
-        print(result)
-    except TypeError as e:
-        print(f"Unable to find pub med central {url} {e}")
-
-def open_ai_request(content):
-    prompt = """Given the following research paper about mouse models for cardiology conditions, please extract the following fields to JSON:
+def process(pmid, content):
+    print("processing", pmid)
+    base_prompt = """Given the following research paper about mouse models for cardiology conditions, please extract the following fields to JSON:
         {
-            "Study Name": text,
+            "Study Name": text, // Use study name from the initial response when possible.
             "Year Published": integer,
             "Mouse Type": text // Mouse Type options "ApoE KO", "LDLr KO",
-            "Sex": text // Sex options for mice included in study are: "Male", "Female", "Both",
+            "Text used to identify sex of mice": text // VERBATIM text used to determine "sex of mice" output. Must reference "mice" explicitly.
+            "Sex of mice": text // Sex of mice explicitly referenced: "Male", "Female" calculated from "text used to identify sex of mice".
             "Impacted Genete": text,
             "Gene Symbol": text,
             "Vessel Location": text // eg. Aorta or aortic branch,
@@ -114,23 +102,45 @@ def open_ai_request(content):
             "Change in Lipid Content": text options: Increase, Decrease, Neutral,
             "Pubmed ID": int
         }
-        The content to analyze is below in HTML format:
-        --------------- 
-    """ + content
 
+        IGNORE sex from human patients.
+        --------------- 
+    """
+    context_window = 16000
+    context_window = 60000
+    for i in range(0, len(content), context_window):
+        if i == 0:
+            print(i, i+context_window)
+            prompt = base_prompt + "The content is below for pub med id " + pmid + ": " + content[i:i+context_window]
+            response = open_ai_request(prompt)
+            last_content = response.choices[0].message.content
+            print(last_content)
+        else:
+            print(i, i+context_window)
+            prompt = base_prompt + f"An initial answer was {last_content}. You can update with the following info: " + content[i:i+context_window]
+            response = open_ai_request(prompt)
+            last_content = response.choices[0].message.content
+            print(last_content)
+
+    return last_content
+
+def open_ai_request(prompt):
     try:
         response = client.chat.completions.create(
-            model="gpt-3.5-turbo-1106",
+            model="gpt-4-1106-preview", #gpt-3.5-turbo-1106",
+            temperature=0,
             messages=[
                 {
                     "role": "user",
-                    "content": prompt,
+                    "content": prompt + " ONLY USE CONTENT PROVIDED. ONLY OUTPUT JSON",
                 }
             ]
         )
+        print(response)
         return response
     except Exception as e:
-        return f"An error occurred: {e}"
+        print(f"An error occurred: {e}")
+        return None
 
 if __name__ == "__main__":
     main()
