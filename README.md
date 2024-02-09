@@ -21,7 +21,7 @@ Create a file pmids.txt that has the pubmed IDs of files you want to download. E
 
 Get going:
 
-    conda active pubmed-env
+    conda activate pubmed-env
     export OPENAI_API_KEY=
     pip install -r requirements.txt
 
